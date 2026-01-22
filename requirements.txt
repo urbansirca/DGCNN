@@ -1,0 +1,19 @@
+# DGCNN + GNNExplainer for EEG Emotion Recognition
+# Python 3.8+
+
+# Core
+torch>=1.11.0
+numpy>=1.21.0
+scipy>=1.7.0
+matplotlib>=3.5.0
+tqdm>=4.62.0
+
+# TorchEEG (includes DGCNN and SEED dataset support)
+torcheeg>=1.1.0
+
+# Optional: for using TorchEEG's trainer
+pytorch-lightning>=1.6.0
+
+# Optional: for advanced visualisation
+seaborn>=0.11.0
+mne>=1.0.0  # For EEG topographic plots
