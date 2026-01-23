@@ -36,7 +36,6 @@ import utils.graph_utils as graph_utils
 from torcheeg.models.gnn.dgcnn import normalize_A
 
 
-
 use_cuda = torch.cuda.is_available()
 FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
@@ -71,11 +70,33 @@ class Explainer:
         self.args = args
         self.writer = writer
         self.print_training = print_training
+        
+    def get_contrast_class(self, label):
+        """
+        Returns the contrast class based on the given label.
+        
+        Args:
+            label (int): The class label (0: negative, 1: neutral, 2: positive).
+            
+        Returns:
+            contrast_class (int): The contrast class label (0, 1, or 2).
+        """
+        # Define the contrast class for each label
+        if label == 0:  # Negative
+            contrast_class = 2  # Contrast with Positive
+        elif label == 2:  # Positive
+            contrast_class = 0  # Contrast with Negative
+        elif label == 1:  # Neutral
+            contrast_class = 0  # Or you could use 2 to contrast with Positive
+        else:
+            raise ValueError(f"Invalid label {label}. Expected 0, 1, or 2.")
+
+        return contrast_class
 
 
     # Main method
     def explain(
-        self, node_idx, graph_idx=0, graph_mode=False, unconstrained=False, model="exp"
+        self, node_idx, graph_idx=0, graph_mode=False, unconstrained=False, model="exp", contrastive=False
     ):
         """Explain a single node prediction
         """
@@ -127,6 +148,14 @@ class Explainer:
 
         self.model.eval()
 
+        contrast_class = None
+        if contrastive:
+            
+            print("PRED LABEL TYPE: ", type(pred_label))
+            print("PRED LABEL: ", pred_label)
+            contrast_class = self.get_contrast_class(
+                pred_label
+            )  # Get contrast class based on predicted label
 
         # gradient baseline
         if model == "grad":
@@ -144,8 +173,9 @@ class Explainer:
             for epoch in range(self.args.num_epochs):
                 explainer.zero_grad()
                 explainer.optimizer.zero_grad()
-                ypred, adj_atts = explainer(node_idx_new, unconstrained=unconstrained)
-                loss = explainer.loss(ypred, pred_label, node_idx_new, epoch)
+                ypred, contrast_pred = explainer(node_idx_new, contrast_class=contrast_class)
+                loss = explainer.loss(ypred, pred_label, node_idx_new, epoch, contrast_class=contrast_class)
+
                 loss.backward()
 
                 explainer.optimizer.step()
@@ -225,8 +255,11 @@ class Explainer:
         with open(os.path.join(self.args.logdir, fname), 'wb') as outfile:
             np.save(outfile, np.asarray(masked_adj.copy()))
             print("Saved adjacency matrix to ", fname)
-        return masked_adj
 
+        # Get feature mask importance
+        feat_mask = torch.sigmoid(explainer.feat_mask).cpu().detach().numpy()
+
+        return masked_adj, feat_mask
 
     # NODE EXPLAINER
     def explain_nodes(self, node_indices, args, graph_idx=0):
@@ -298,7 +331,6 @@ class Explainer:
 
         return masked_adjs
 
-
     def explain_nodes_gnn_stats(self, node_indices, args, graph_idx=0, model="exp"):
         masked_adjs = [
             self.explain(node_idx, graph_idx=graph_idx, model=model)
@@ -360,14 +392,19 @@ class Explainer:
         return masked_adjs
 
     # GRAPH EXPLAINER
-    def explain_graphs(self, graph_indices):
+    def explain_graphs(self, graph_indices, contrastive=False):
         """
         Explain graphs.
+
+        Returns:
+            masked_adjs: list of masked adjacency matrices
+            feat_masks: list of feature mask importance arrays
         """
         masked_adjs = []
+        feat_masks = []
 
         for graph_idx in graph_indices:
-            masked_adj = self.explain(node_idx=0, graph_idx=graph_idx, graph_mode=True)
+            masked_adj, feat_mask = self.explain(node_idx=0, graph_idx=graph_idx, graph_mode=True, contrastive=contrastive)
             G_denoised = io_utils.denoise_graph(
                 masked_adj,
                 0,
@@ -385,6 +422,7 @@ class Explainer:
                 args=self.args
             )
             masked_adjs.append(masked_adj)
+            feat_masks.append(feat_mask)
 
             G_orig = io_utils.denoise_graph(
                 self.adj[graph_idx],
@@ -406,7 +444,7 @@ class Explainer:
         # plot cmap for graphs' node features
         io_utils.plot_cmap_tb(self.writer, "tab20", 20, "tab20_cmap")
 
-        return masked_adjs
+        return masked_adjs, feat_masks
 
     def log_representer(self, rep_val, sim_val, alpha, graph_idx=0):
         """ visualize output of representer instances. """
@@ -493,7 +531,6 @@ class Explainer:
         if self.args.gpu:
             pred_idx = pred_idx.cuda()
         self.alpha = self.preds_grad
-
 
     # Utilities
     def extract_neighborhood(self, node_idx, graph_idx=0):
@@ -733,7 +770,7 @@ class ExplainModule(nn.Module):
     #         res = nn.Softmax(dim=0)(node_pred)
     #     return res, adj_att
     
-    def forward(self, node_idx, unconstrained=False, mask_features=True, marginalize=False):
+    def forward(self, node_idx, contrast_class=None, unconstrained=False, mask_features=True, marginalize=False):
         x = self.x.cuda() if self.args.gpu else self.x
 
         # Feature masking
@@ -766,6 +803,10 @@ class ExplainModule(nn.Module):
 
         # Return softmax (graph-level)
         res = nn.Softmax(dim=1)(ypred)
+        
+        if contrast_class is not None:
+            contrast_result = nn.Softmax(dim=1)(ypred)[0, contrast_class]
+            return res, contrast_result
         return res, None
     
     #  def adj_feat_grad(self, node_idx, pred_label_node):
@@ -813,25 +854,110 @@ class ExplainModule(nn.Module):
         adj_grad = self.model.A.grad if self.model.A.grad is not None else torch.zeros_like(self.model.A)
         return adj_grad.unsqueeze(0), self.x.grad
 
-    def loss(self, pred, pred_label, node_idx, epoch):
-        """
-        Args:
-            pred: prediction made by current model
-            pred_label: the label predicted by the original model.
-        """
-        mi_obj = False
-        if mi_obj:
-            pred_loss = -torch.sum(pred * torch.log(pred))
+    # def loss(self, pred, pred_label, node_idx, epoch):
+    #     """
+    #     Args:
+    #         pred: prediction made by current model
+    #         pred_label: the label predicted by the original model.
+    #     """
+    #     mi_obj = False
+    #     if mi_obj:
+    #         pred_loss = -torch.sum(pred * torch.log(pred))
+    #     else:
+    #         pred_label_node = pred_label if self.graph_mode else pred_label[node_idx]
+    #         gt_label_node = self.label if self.graph_mode else self.label[0][node_idx]
+    #         # Handle both (num_classes,) and (batch, num_classes) shapes
+    #         if pred.dim() == 1:
+    #             logit = pred[gt_label_node]
+    #         else:
+    #             logit = pred[0, gt_label_node]
+    #         pred_loss = -torch.log(logit)
+    #     # size
+    #     mask = self.mask
+    #     if self.mask_act == "sigmoid":
+    #         mask = torch.sigmoid(self.mask)
+    #     elif self.mask_act == "ReLU":
+    #         mask = nn.ReLU()(self.mask)
+    #     size_loss = self.coeffs["size"] * torch.sum(mask)
+
+    #     # pre_mask_sum = torch.sum(self.feat_mask)
+    #     feat_mask = (
+    #         torch.sigmoid(self.feat_mask) if self.use_sigmoid else self.feat_mask
+    #     )
+    #     feat_size_loss = self.coeffs["feat_size"] * torch.mean(feat_mask)
+
+    #     # entropy
+    #     mask_ent = -mask * torch.log(mask) - (1 - mask) * torch.log(1 - mask)
+    #     mask_ent_loss = self.coeffs["ent"] * torch.mean(mask_ent)
+
+    #     feat_mask_ent = - feat_mask             \
+    #                     * torch.log(feat_mask)  \
+    #                     - (1 - feat_mask)       \
+    #                     * torch.log(1 - feat_mask)
+
+    #     feat_mask_ent_loss = self.coeffs["feat_ent"] * torch.mean(feat_mask_ent)
+
+    #     # laplacian
+    #     D = torch.diag(torch.sum(self.masked_adj[0], 0))
+    #     m_adj = self.masked_adj if self.graph_mode else self.masked_adj[self.graph_idx]
+    #     L = D - m_adj
+    #     pred_label_t = torch.tensor(pred_label, dtype=torch.float)
+    #     if self.args.gpu:
+    #         pred_label_t = pred_label_t.cuda()
+    #         L = L.cuda()
+    #     if self.graph_mode:
+    #         lap_loss = 0
+    #     else:
+    #         lap_loss = (self.coeffs["lap"]
+    #             * (pred_label_t @ L @ pred_label_t)
+    #             / self.adj.numel()
+    #         )
+
+    #     # grad
+    #     # adj
+    #     # adj_grad, x_grad = self.adj_feat_grad(node_idx, pred_label_node)
+    #     # adj_grad = adj_grad[self.graph_idx]
+    #     # x_grad = x_grad[self.graph_idx]
+    #     # if self.args.gpu:
+    #     #    adj_grad = adj_grad.cuda()
+    #     # grad_loss = self.coeffs['grad'] * -torch.mean(torch.abs(adj_grad) * mask)
+
+    #     # feat
+    #     # x_grad_sum = torch.sum(x_grad, 1)
+    #     # grad_feat_loss = self.coeffs['featgrad'] * -torch.mean(x_grad_sum * mask)
+
+    #     loss = pred_loss + size_loss + lap_loss + mask_ent_loss + feat_size_loss
+    #     if self.writer is not None:
+    #         self.writer.add_scalar("optimization/size_loss", size_loss, epoch)
+    #         self.writer.add_scalar("optimization/feat_size_loss", feat_size_loss, epoch)
+    #         self.writer.add_scalar("optimization/mask_ent_loss", mask_ent_loss, epoch)
+    #         self.writer.add_scalar(
+    #             "optimization/feat_mask_ent_loss", mask_ent_loss, epoch
+    #         )
+    #         # self.writer.add_scalar('opt imization/grad_loss', grad_loss, epoch)
+    #         self.writer.add_scalar("optimization/pred_loss", pred_loss, epoch)
+    #         self.writer.add_scalar("optimization/lap_loss", lap_loss, epoch)
+    #         self.writer.add_scalar("optimization/overall_loss", loss, epoch)
+    #     return loss
+    
+    
+    def loss(self, pred, pred_label, node_idx, epoch, contrast_class=None):
+        # Standard loss (same as before)
+        pred_label_node = pred_label if self.graph_mode else pred_label[node_idx]
+        gt_label_node = self.label if self.graph_mode else self.label[0][node_idx]
+
+        # Calculate the loss for the predicted class (Y = c)
+        logit = pred[0, gt_label_node]  # For graph-level prediction
+        pred_loss = -torch.log(logit)
+
+        # If contrast class is provided, compute the contrastive loss (Y = c')
+        if contrast_class is not None:
+            contrast_logit = pred[0, contrast_class]  # Contrast class (Y = c')
+            contrast_loss = torch.log(contrast_logit)
         else:
-            pred_label_node = pred_label if self.graph_mode else pred_label[node_idx]
-            gt_label_node = self.label if self.graph_mode else self.label[0][node_idx]
-            # Handle both (num_classes,) and (batch, num_classes) shapes
-            if pred.dim() == 1:
-                logit = pred[gt_label_node]
-            else:
-                logit = pred[0, gt_label_node]
-            pred_loss = -torch.log(logit)
-        # size
+            contrast_loss = 0  # If no contrast class is specified, no contrastive loss
+
+        # Regularization terms (sparsity, entropy)
         mask = self.mask
         if self.mask_act == "sigmoid":
             mask = torch.sigmoid(self.mask)
@@ -839,65 +965,27 @@ class ExplainModule(nn.Module):
             mask = nn.ReLU()(self.mask)
         size_loss = self.coeffs["size"] * torch.sum(mask)
 
-        # pre_mask_sum = torch.sum(self.feat_mask)
-        feat_mask = (
-            torch.sigmoid(self.feat_mask) if self.use_sigmoid else self.feat_mask
-        )
+        feat_mask = torch.sigmoid(self.feat_mask) if self.use_sigmoid else self.feat_mask
         feat_size_loss = self.coeffs["feat_size"] * torch.mean(feat_mask)
 
-        # entropy
+        # Entropy and Laplacian regularization
         mask_ent = -mask * torch.log(mask) - (1 - mask) * torch.log(1 - mask)
         mask_ent_loss = self.coeffs["ent"] * torch.mean(mask_ent)
 
-        feat_mask_ent = - feat_mask             \
-                        * torch.log(feat_mask)  \
-                        - (1 - feat_mask)       \
-                        * torch.log(1 - feat_mask)
+        # Total loss (combine standard loss and contrastive loss)
+        loss = pred_loss + contrast_loss + size_loss + feat_size_loss + mask_ent_loss
 
-        feat_mask_ent_loss = self.coeffs["feat_ent"] * torch.mean(feat_mask_ent)
-
-        # laplacian
-        D = torch.diag(torch.sum(self.masked_adj[0], 0))
-        m_adj = self.masked_adj if self.graph_mode else self.masked_adj[self.graph_idx]
-        L = D - m_adj
-        pred_label_t = torch.tensor(pred_label, dtype=torch.float)
-        if self.args.gpu:
-            pred_label_t = pred_label_t.cuda()
-            L = L.cuda()
-        if self.graph_mode:
-            lap_loss = 0
-        else:
-            lap_loss = (self.coeffs["lap"]
-                * (pred_label_t @ L @ pred_label_t)
-                / self.adj.numel()
-            )
-
-        # grad
-        # adj
-        # adj_grad, x_grad = self.adj_feat_grad(node_idx, pred_label_node)
-        # adj_grad = adj_grad[self.graph_idx]
-        # x_grad = x_grad[self.graph_idx]
-        # if self.args.gpu:
-        #    adj_grad = adj_grad.cuda()
-        # grad_loss = self.coeffs['grad'] * -torch.mean(torch.abs(adj_grad) * mask)
-
-        # feat
-        # x_grad_sum = torch.sum(x_grad, 1)
-        # grad_feat_loss = self.coeffs['featgrad'] * -torch.mean(x_grad_sum * mask)
-
-        loss = pred_loss + size_loss + lap_loss + mask_ent_loss + feat_size_loss
+        # Log to tensorboard if writer is provided
         if self.writer is not None:
+            self.writer.add_scalar("optimization/pred_loss", pred_loss, epoch)
+            self.writer.add_scalar("optimization/contrast_loss", contrast_loss, epoch)
             self.writer.add_scalar("optimization/size_loss", size_loss, epoch)
             self.writer.add_scalar("optimization/feat_size_loss", feat_size_loss, epoch)
             self.writer.add_scalar("optimization/mask_ent_loss", mask_ent_loss, epoch)
-            self.writer.add_scalar(
-                "optimization/feat_mask_ent_loss", mask_ent_loss, epoch
-            )
-            # self.writer.add_scalar('optimization/grad_loss', grad_loss, epoch)
-            self.writer.add_scalar("optimization/pred_loss", pred_loss, epoch)
-            self.writer.add_scalar("optimization/lap_loss", lap_loss, epoch)
             self.writer.add_scalar("optimization/overall_loss", loss, epoch)
+
         return loss
+
 
     def log_mask(self, epoch):
         plt.switch_backend("agg")
@@ -1059,4 +1147,3 @@ class ExplainModule(nn.Module):
                 edge_vmax=None,
                 args=self.args,
             )
-

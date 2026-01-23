@@ -116,5 +116,5 @@ for epoch in range(EPOCHS):
 print("Training complete!")
 
 # save model
-torch.save(model.state_dict(), 'dgcnn_seed_model.pth')
+torch.save(model.state_dict(), 'ckpts/dgcnn_seed_model.pth')
 print("Model saved!")

@@ -9,6 +9,12 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops
 from torcheeg.models import DGCNN
 
+from torch_geometric.explain import Explainer, GNNExplainer
+from torcheeg.datasets import SEEDDataset
+from torcheeg import transforms
+from contrastive_explainer import explain_class_contrast
+
+
 
 # ============================================================================
 # MODEL DEFINITIONS
@@ -753,17 +759,290 @@ def visualize_edge_importance_circular(
     return fig
 
 
+def visualize_edge_importance_circular_subplots(
+    edge_index: torch.Tensor,
+    edge_masks: dict,
+    class_names: list,
+    num_electrodes: int = 62,
+    electrode_names: list = None,
+    n_lines: int = 50,
+    title: str = "Edge Importance by Class",
+    save_path: str = None,
+    ncols: int = None,
+    normalize_per_plot: bool = False,
+):
+    """
+    Visualize edge importance for multiple classes as subplots.
+
+    Args:
+        edge_index: Edge indices [2, num_edges]
+        edge_masks: Dictionary mapping class_idx/key -> edge_mask tensor
+        class_names: List of class names (in order of edge_masks keys)
+        num_electrodes: Number of electrodes
+        electrode_names: List of electrode names
+        n_lines: Number of top connections to display
+        title: Overall figure title
+        save_path: Path to save the figure
+        ncols: Number of columns (auto-determined if None)
+        normalize_per_plot: If True, normalize each plot independently (useful for contrastive)
+    """
+    from mne.viz import circular_layout
+    from mne_connectivity.viz import plot_connectivity_circle
+
+    if electrode_names is None:
+        electrode_names = SEED_ELECTRODE_NAMES[:num_electrodes]
+
+    edge_idx_np = edge_index.cpu().numpy()
+
+    # Group electrodes by hemisphere
+    lh_electrodes = [
+        name for name in electrode_names if name.endswith(("1", "3", "5", "7"))
+    ]
+    mid_electrodes = [name for name in electrode_names if name.endswith("Z")]
+    rh_electrodes = [
+        name for name in electrode_names if name.endswith(("2", "4", "6", "8"))
+    ]
+
+    node_order = lh_electrodes + mid_electrodes + rh_electrodes
+
+    node_angles = circular_layout(
+        electrode_names,
+        node_order,
+        start_pos=90,
+        group_boundaries=[
+            0,
+            len(lh_electrodes),
+            len(lh_electrodes) + len(mid_electrodes),
+        ],
+    )
+
+    node_colors = []
+    for name in electrode_names:
+        if name in lh_electrodes:
+            node_colors.append("#4A90D9")
+        elif name in mid_electrodes:
+            node_colors.append("#2ECC71")
+        else:
+            node_colors.append("#E74C3C")
+
+    num_plots = len(edge_masks)
+
+    # Determine grid layout
+    if ncols is None:
+        if num_plots <= 3:
+            ncols = num_plots
+        else:
+            ncols = 3
+    nrows = (num_plots + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(5 * ncols, 5 * nrows),
+        facecolor="black",
+        subplot_kw=dict(polar=True),
+    )
+
+    # Flatten axes for easy iteration
+    if num_plots == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+
+    # Build connectivity matrices
+    global_max = 0
+    conn_matrices = {}
+    for key, edge_mask in edge_masks.items():
+        edge_importance = edge_mask.cpu().numpy()
+        conn_matrix = np.zeros((num_electrodes, num_electrodes))
+        for i in range(edge_idx_np.shape[1]):
+            src, dst = edge_idx_np[0, i], edge_idx_np[1, i]
+            if src != dst:
+                conn_matrix[src, dst] = edge_importance[i]
+        conn_matrix = (conn_matrix + conn_matrix.T) / 2
+        conn_matrices[key] = conn_matrix
+        global_max = max(global_max, conn_matrix.max())
+
+    for ax_idx, (key, conn_matrix) in enumerate(conn_matrices.items()):
+        # Get label from class_names list
+        label = class_names[ax_idx] if ax_idx < len(class_names) else str(key)
+
+        # Use per-plot or global normalization
+        vmax = conn_matrix.max() if normalize_per_plot else global_max
+
+        plot_connectivity_circle(
+            conn_matrix,
+            electrode_names,
+            n_lines=n_lines,
+            node_angles=node_angles,
+            node_colors=node_colors,
+            title=label,
+            ax=axes[ax_idx],
+            colormap="hot",
+            fontsize_names=5,
+            fontsize_title=10,
+            padding=2.0,
+            show=False,
+            vmin=0,
+            vmax=vmax,
+        )
+
+    # Hide unused axes
+    for ax_idx in range(num_plots, len(axes)):
+        axes[ax_idx].set_visible(False)
+
+    fig.suptitle(title, fontsize=14, color="white", y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, facecolor="black", bbox_inches="tight")
+    plt.show()
+
+    return fig
+
+
+def visualize_node_importance_subplots(
+    node_masks: dict,
+    class_names: list,
+    electrode_names: list = None,
+    title: str = "Node Importance by Class",
+    save_path: str = None,
+    ncols: int = None,
+    normalize_per_plot: bool = False,
+):
+    """
+    Visualize node importance for multiple classes as subplots.
+
+    Args:
+        node_masks: Dictionary mapping class_idx/key -> node_mask tensor
+        class_names: List of class names (in order of node_masks keys)
+        electrode_names: List of electrode names
+        title: Overall figure title
+        save_path: Path to save the figure
+        ncols: Number of columns (auto-determined if None)
+        normalize_per_plot: If True, normalize each plot independently (useful for contrastive)
+    """
+    if electrode_names is None:
+        electrode_names = SEED_ELECTRODE_NAMES
+
+    num_plots = len(node_masks)
+
+    # Determine grid layout
+    if ncols is None:
+        if num_plots <= 3:
+            ncols = num_plots
+        else:
+            ncols = 3
+    nrows = (num_plots + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+
+    # Flatten axes for easy iteration
+    if num_plots == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+
+    # Get first mask to determine num_electrodes
+    first_mask = list(node_masks.values())[0]
+    num_electrodes = len(first_mask) if first_mask.dim() == 1 else first_mask.shape[0]
+    positions = get_electrode_positions(num_electrodes)
+
+    # Normalize all masks together for consistent color scaling
+    all_importances = []
+    for node_mask in node_masks.values():
+        if node_mask.dim() > 1:
+            importance = node_mask.mean(dim=-1).cpu().numpy()
+        else:
+            importance = node_mask.cpu().numpy()
+        all_importances.append(importance)
+
+    all_importances = np.array(all_importances)
+    global_min = all_importances.min()
+    global_max = all_importances.max()
+
+    for ax_idx, (key, node_mask) in enumerate(node_masks.items()):
+        ax = axes[ax_idx]
+
+        if node_mask.dim() > 1:
+            importance = node_mask.mean(dim=-1).cpu().numpy()
+        else:
+            importance = node_mask.cpu().numpy()
+
+        # Normalize using global or per-plot min/max
+        if normalize_per_plot:
+            local_min, local_max = importance.min(), importance.max()
+            importance_norm = (importance - local_min) / (local_max - local_min + 1e-10)
+        else:
+            importance_norm = (importance - global_min) / (global_max - global_min + 1e-10)
+
+        # Draw head outline
+        circle = plt.Circle((0, 0.35), 0.65, fill=False, color="black", linewidth=2)
+        ax.add_patch(circle)
+        ax.plot([0, 0.1, 0], [1.0, 1.1, 1.0], "k-", linewidth=2)
+        ax.plot([-0.65, -0.7, -0.65], [0.3, 0.35, 0.4], "k-", linewidth=2)
+        ax.plot([0.65, 0.7, 0.65], [0.3, 0.35, 0.4], "k-", linewidth=2)
+
+        scatter = ax.scatter(
+            positions[:, 0],
+            positions[:, 1],
+            c=importance_norm,
+            cmap="Reds",
+            s=200,
+            edgecolors="black",
+            linewidths=1,
+            vmin=0,
+            vmax=1,
+        )
+
+        for i, (x, y) in enumerate(positions):
+            ax.annotate(
+                electrode_names[i] if i < len(electrode_names) else str(i),
+                (x, y),
+                ha="center",
+                va="center",
+                fontsize=4,
+                fontweight="bold",
+            )
+
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-0.5, 1.2)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+        # Get label from class_names list
+        label = class_names[ax_idx] if ax_idx < len(class_names) else str(key)
+        ax.set_title(label, fontsize=10)
+
+    # Hide unused axes
+    for ax_idx in range(num_plots, len(axes)):
+        axes[ax_idx].set_visible(False)
+
+    # Add a shared colorbar
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    sm = plt.cm.ScalarMappable(cmap="Reds", norm=plt.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    fig.colorbar(sm, cax=cbar_ax, label="Importance")
+
+    fig.suptitle(title, fontsize=14, y=1.02)
+    plt.tight_layout(rect=[0, 0, 0.9, 1])
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+    return fig
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
-    from torch_geometric.explain import Explainer, GNNExplainer
-    from torcheeg.datasets import SEEDDataset
-    from torcheeg import transforms
 
     # Configuration
-    THRESHOLD = 0.3
+    THRESHOLD = 0
+    N_SAMPLES_PER_CLASS = 50
+    N_LINES = 10
     BATCH_SIZE = 256
     DEVICE = torch.device(
         "cuda"
@@ -858,79 +1137,6 @@ if __name__ == "__main__":
         ),
     )
 
-    # # Get samples from each class
-    # print("\nGenerating Explanations...")
-    # class_samples = {0: None, 1: None, 2: None}
-    # class_names = ["Negative", "Neutral", "Positive"]
-
-    # for x, y in test_loader:
-    #     for i in range(len(y)):
-    #         label = y[i].item()
-    #         if class_samples[label] is None:
-    #             class_samples[label] = x[i]
-    #         if all(v is not None for v in class_samples.values()):
-    #             break
-    #     if all(v is not None for v in class_samples.values()):
-    #         break
-
-    # # Generate explanations
-    # for class_idx, sample in class_samples.items():
-    #     if sample is None:
-    #         continue
-
-    #     print(f"\nExplaining sample from class: {class_names[class_idx]}")
-
-    #     sample_for_explainer = sample.squeeze()
-    #     print(f"  Sample shape: {sample_for_explainer.shape}")
-
-    #     explanation = explainer(
-    #         x=sample_for_explainer,
-    #         edge_index=edge_index,
-    #         edge_weight=edge_weight,
-    #     )
-
-    #     print(f"  Node mask shape: {explanation.node_mask.shape}")
-    #     print(f"  Edge mask shape: {explanation.edge_mask.shape}")
-
-    #     # Visualize
-    #     node_mask = explanation.node_mask.squeeze()
-    #     visualize_node_importance(
-    #         node_mask,
-    #         title=f"Node Importance - {class_names[class_idx]} Emotion",
-    #         save_path=f"node_importance_class_{class_idx}.png",
-    #     )
-
-    #     visualize_edge_importance(
-    #         edge_index,
-    #         explanation.edge_mask,
-    #         num_electrodes=62,
-    #         top_k=50,
-    #         title=f"Edge Importance - {class_names[class_idx]} Emotion",
-    #         save_path=f"edge_importance_class_{class_idx}.png",
-    #     )
-
-    #     # Visualize edges - standard plot
-    #     visualize_edge_importance(
-    #         edge_index,
-    #         explanation.edge_mask,
-    #         num_electrodes=62,
-    #         top_k=50,
-    #         title=f"Edge Importance - {class_names[class_idx]} Emotion",
-    #         save_path=f"edge_importance_class_{class_idx}.png",
-    #     )
-
-    #     # Visualize edges - circular plot
-    #     visualize_edge_importance_circular(
-    #         edge_index,
-    #         explanation.edge_mask,
-    #         num_electrodes=62,
-    #         n_lines=50,
-    #         title=f"Edge Importance - {class_names[class_idx]} Emotion",
-    #         save_path=f"edge_importance_circular_class_{class_idx}.png",
-    #     )
-
-    # print("\nDone!")
-
 
     print("\nGenerating aggregated explanations...")
     aggregated = get_aggregated_explanations(
@@ -938,29 +1144,113 @@ if __name__ == "__main__":
         data_loader=test_loader,
         edge_index=edge_index,
         edge_weight=edge_weight,
-        num_samples_per_class=50,  # Adjust based on time constraints
+        num_samples_per_class=N_SAMPLES_PER_CLASS,  
         num_classes=3,
     )
-    
+
     class_names = ["Negative", "Neutral", "Positive"]
-    
-    # Visualize aggregated results
-    for class_idx, data in aggregated.items():
-        print(f"\nClass: {class_names[class_idx]} (n={data['num_samples']})")
-        
-        # Node importance (averaged)
-        visualize_node_importance(
-            data['node_mask_mean'],
-            title=f"Avg Node Importance - {class_names[class_idx]} (n={data['num_samples']})",
-            save_path=f"avg_node_importance_class_{class_idx}.png",
+
+
+    # Visualize aggregated results - ALL CLASSES IN SUBPLOTS
+    # Edge importance subplots (circular)
+    edge_masks_dict = {idx: data['edge_mask_mean'] for idx, data in aggregated.items()}
+    visualize_edge_importance_circular_subplots(
+        edge_index=edge_index,
+        edge_masks=edge_masks_dict,
+        class_names=class_names,
+        num_electrodes=62,
+        n_lines=N_LINES,
+        title="Average Edge Importance by Class",
+        save_path="plots/avg_edge_importance_all_classes.png",
+    )
+
+    # Node importance subplots
+    node_masks_dict = {idx: data['node_mask_mean'] for idx, data in aggregated.items()}
+    visualize_node_importance_subplots(
+        node_masks=node_masks_dict,
+        class_names=class_names,
+        title="Average Node Importance by Class",
+        save_path="plots/avg_node_importance_all_classes.png",
+    )
+
+    class_names = ["Negative", "Neutral", "Positive"]
+
+    # Define class pairs to contrast
+    contrasts = [
+        (0, 2, "Negative vs Positive"),  # What makes Negative different from Positive?
+        (2, 0, "Positive vs Negative"),  # What makes Positive different from Negative?
+        (0, 1, "Negative vs Neutral"),  # What makes Negative different from Neutral?
+        (1, 0, "Neutral vs Negative"),  # What makes Neutral different from Negative?
+        (1, 2, "Neutral vs Positive"),  # What makes Neutral different from Positive?
+        (2, 1, "Positive vs Neutral"),  # What makes Positive different from Neutral?
+    ]
+
+    # Get one sample per class
+    class_samples = {0: None, 1: None, 2: None}
+    for x, y in test_loader:
+        for i in range(len(y)):
+            label = y[i].item()
+            if class_samples[label] is None:
+                class_samples[label] = x[i]
+            if all(v is not None for v in class_samples.values()):
+                break
+        if all(v is not None for v in class_samples.values()):
+            break
+
+    # Generate contrastive explanations and collect masks
+    contrastive_node_masks = {}
+    contrastive_edge_masks = {}
+    contrast_labels = []
+
+    for target_class, contrast_class, description in contrasts:
+        print(f"\n{'='*60}")
+        print(f"Contrastive Explanation: {description}")
+        print(f"  Target class: {class_names[target_class]}")
+        print(f"  Contrast class: {class_names[contrast_class]}")
+        print(f"{'='*60}")
+
+        sample = class_samples[target_class].squeeze()
+
+        explanation = explain_class_contrast(
+            explainer_model=explainer_model,
+            sample=sample,
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+            target_class=target_class,
+            contrast_class=contrast_class,
+            epochs=200,
+            contrast_weight=1.0,
         )
-        
-        # Edge importance (averaged)
-        visualize_edge_importance_circular(
-            edge_index,
-            data['edge_mask_mean'],
-            num_electrodes=62,
-            n_lines=50,
-            title=f"Avg Edge Importance - {class_names[class_idx]}",
-            save_path=f"avg_edge_importance_circular_class_{class_idx}.png",
-        )
+
+        print(f"  Node mask shape: {explanation.node_mask.shape}")
+        print(f"  Edge mask shape: {explanation.edge_mask.shape}")
+
+        # Store masks for subplot visualization
+        key = f"{target_class}_vs_{contrast_class}"
+        contrastive_node_masks[key] = explanation.node_mask.squeeze()
+        contrastive_edge_masks[key] = explanation.edge_mask
+        contrast_labels.append(description)
+
+    # Visualize all contrastive explanations as subplots
+    print("\nGenerating contrastive subplot visualizations...")
+
+    # Edge importance subplots (circular)
+    visualize_edge_importance_circular_subplots(
+        edge_index=edge_index,
+        edge_masks=contrastive_edge_masks,
+        class_names=contrast_labels,
+        num_electrodes=62,
+        n_lines=N_LINES,
+        title="Contrastive Edge Importance",
+        save_path="plots/contrastive_edge_all.png",
+        normalize_per_plot=True,  # Each contrast normalized independently
+    )
+
+    # Node importance subplots
+    visualize_node_importance_subplots(
+        node_masks=contrastive_node_masks,
+        class_names=contrast_labels,
+        title="Contrastive Node Importance",
+        save_path="plots/contrastive_node_all.png",
+        normalize_per_plot=True,  # Each contrast normalized independently
+    )
