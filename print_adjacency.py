@@ -11,11 +11,11 @@ import numpy as np
 
 
 os.makedirs('plots', exist_ok=True)
-model_type = 'lower'
+model_type = ''
 
 # Load model
-model = DGCNN(in_channels=5, num_electrodes=62, hid_channels=32, num_layers=1, num_classes=3)
-model.load_state_dict(torch.load(f'ckpts/dgcnn_seed_model_{model_type}.pth', map_location='cpu'))
+model = DGCNN(in_channels=5, num_electrodes=62, hid_channels=32, num_layers=2, num_classes=3)
+model.load_state_dict(torch.load(f'ckpts/dgcnn_seed_model{model_type}.pth', map_location='cpu'))
 
 # Get learned adjacency matrix
 A = model.A.detach().numpy()

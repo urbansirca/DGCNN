@@ -22,7 +22,12 @@ from contrastive_explainer import explain_class_contrast
 
 
 class PyGGraphConvolution(MessagePassing):
-    """Graph convolution using PyG's message passing for GNNExplainer compatibility."""
+    """
+    Graph convolution using PyG's message passing for GNNExplainer compatibility.
+
+    Original DGCNN order: out = (adj @ x) @ weight
+    This must be preserved for equivalence.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
         super().__init__(aggr="add")
@@ -43,11 +48,12 @@ class PyGGraphConvolution(MessagePassing):
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor = None,
     ) -> torch.Tensor:
-        # Transform features first
-        x = torch.matmul(x, self.weight)
-
-        # Propagate with edge weights
+        # IMPORTANT: Original DGCNN does (adj @ x) @ weight
+        # Step 1: Propagate first (equivalent to adj @ x)
         out = self.propagate(edge_index, x=x, edge_weight=edge_weight)
+
+        # Step 2: Then apply weight transformation
+        out = torch.matmul(out, self.weight)
 
         if self.bias is not None:
             out = out + self.bias
@@ -64,8 +70,14 @@ class PyGChebynet(nn.Module):
     """
     Chebyshev graph convolution using PyG message passing.
 
-    For GNNExplainer compatibility, all convolutions use the SAME edge_index.
-    We handle different Chebyshev polynomial orders by manipulating edge weights.
+    Original Chebynet generates Chebyshev polynomial bases:
+    - T_0(L) = I (identity)
+    - T_1(L) = L (normalized adjacency)
+    - T_k(L) = 2*L*T_{k-1}(L) - T_{k-2}(L) (recursive)
+
+    For GNNExplainer compatibility, we use edge_weight to control the adjacency.
+    T_0 term: just x @ weight (identity, no graph propagation)
+    T_1 term: (L @ x) @ weight (use normalized adjacency)
     """
 
     def __init__(self, in_channels: int, num_layers: int, out_channels: int):
@@ -86,8 +98,8 @@ class PyGChebynet(nn.Module):
         """
         Args:
             x: Node features [num_nodes, in_channels]
-            edge_index: Edge indices [2, num_edges] - MUST include self-loops
-            edge_weight: Edge weights [num_edges]
+            edge_index: Edge indices [2, num_edges] - includes self-loops
+            edge_weight: Normalized edge weights [num_edges] (from D^-0.5 @ A @ D^-0.5)
             num_nodes: Number of nodes
             self_loop_mask: Boolean mask indicating which edges are self-loops [num_edges]
         """
@@ -96,7 +108,7 @@ class PyGChebynet(nn.Module):
         for k in range(self.num_layers):
             if k == 0:
                 # T_0(L) * x = I * x
-                # Use only self-loops: set non-self-loop weights to 0
+                # Identity: only use self-loops with weight 1
                 if self_loop_mask is not None:
                     weights_k = torch.where(
                         self_loop_mask,
@@ -104,16 +116,12 @@ class PyGChebynet(nn.Module):
                         torch.zeros_like(edge_weight),
                     )
                 else:
+                    # Fallback: use edge_weight as-is
                     weights_k = edge_weight
             else:
-                # T_1(L) * x = L * x (and higher orders)
-                # Use the actual edge weights (excluding self-loops for pure L)
-                if self_loop_mask is not None:
-                    weights_k = torch.where(
-                        self_loop_mask, torch.zeros_like(edge_weight), edge_weight
-                    )
-                else:
-                    weights_k = edge_weight
+                # T_1(L) * x = L * x
+                # Use the full normalized adjacency (including self-loops from normalization)
+                weights_k = edge_weight
 
             conv_out = self.convs[k](x, edge_index, weights_k)
 
@@ -215,63 +223,74 @@ class DGCNNForExplainerPyG(nn.Module):
         return edge_weight
 
     def _get_normalized_edge_weights(self, edge_index: torch.Tensor) -> torch.Tensor:
-        """Compute normalized edge weights from learned adjacency."""
+        """
+        Compute normalized edge weights matching original normalize_A function.
+
+        Original normalize_A does:
+            A = F.relu(A)
+            d = torch.sum(A, 1)  # row sum of full matrix
+            d = 1 / sqrt(d + 1e-10)
+            D = diag(d)
+            L = D @ A @ D  (symmetric normalization)
+
+        IMPORTANT: edge_index is in transposed form for message passing:
+        - edge_index[0] = source (j), edge_index[1] = target (i)
+        - This represents L[i,j] for computing L @ x
+        """
         A = F.relu(self.learned_A)
 
-        # Get weights for the given edges
-        edge_weight = A[edge_index[0], edge_index[1]]
+        # Compute degree from FULL adjacency matrix (row sums)
+        deg = A.sum(dim=1)
 
-        # Identify self-loops
-        self_loop_mask = edge_index[0] == edge_index[1]
+        # Compute D^-0.5
+        deg_inv_sqrt = (deg + 1e-10).pow(-0.5)
 
-        # For normalization, we need to compute degrees from non-self-loop edges
-        non_self_loop_mask = ~self_loop_mask
+        # edge_index: [0]=source=j, [1]=target=i
+        # We need weight L[i,j] = deg_inv_sqrt[i] * A[i,j] * deg_inv_sqrt[j]
+        src, dst = edge_index  # src=j, dst=i
+        # A[i,j] = A[dst, src]
+        edge_weight = A[dst, src]
+        # L[i,j] = D^-0.5[i] * A[i,j] * D^-0.5[j]
+        normalized_weight = deg_inv_sqrt[dst] * edge_weight * deg_inv_sqrt[src]
 
-        row, col = edge_index
-        deg = torch.zeros(self.num_electrodes, device=edge_index.device)
-
-        # Only count non-self-loop edges for degree
-        deg.scatter_add_(0, row[non_self_loop_mask], edge_weight[non_self_loop_mask])
-
-        deg_inv_sqrt = deg.pow(-0.5)
-        deg_inv_sqrt[deg_inv_sqrt == float("inf")] = 0
-
-        # Normalize non-self-loop edges
-        norm = torch.ones_like(edge_weight)
-        norm[non_self_loop_mask] = (
-            deg_inv_sqrt[row[non_self_loop_mask]]
-            * edge_weight[non_self_loop_mask]
-            * deg_inv_sqrt[col[non_self_loop_mask]]
-        )
-
-        # Self-loops keep weight 1
-        norm[self_loop_mask] = 1.0
-
-        return norm
+        return normalized_weight
 
     def get_edge_index_and_attr(self, threshold: float = 0.0):
         """
-        Convert learned adjacency to edge format WITH self-loops included.
-        This is crucial for GNNExplainer compatibility.
+        Convert learned adjacency to edge format.
+
+        IMPORTANT: For matrix multiplication L @ x via message passing:
+        - PyG aggregates messages at the TARGET node (edge_index[1])
+        - For L[i,j] * x[j] to contribute to output[i], we need edge (j -> i)
+        - So edge_index = [[j, ...], [i, ...]] with weight L[i,j]
+        - This means we TRANSPOSE the usual edge representation
+
+        For T_0 (identity), we need self-loops.
+        For T_1 (adjacency), we need the actual adjacency edges.
         """
         A = F.relu(self.learned_A)
 
-        # Get non-self-loop edges
+        # Get all edges above threshold
         if threshold > 0:
             mask = A > threshold
         else:
             mask = A > 1e-10
 
-        # Remove diagonal from mask (we'll add self-loops separately)
+        # Remove diagonal - we'll add self-loops separately for T_0 handling
         diag_mask = torch.eye(self.num_electrodes, dtype=torch.bool, device=A.device)
         mask = mask & ~diag_mask
 
-        edge_index = torch.nonzero(mask, as_tuple=False).t().contiguous()
-        edge_attr = A[edge_index[0], edge_index[1]]
+        # nonzero gives [row, col] = [i, j] where A[i,j] > threshold
+        indices = torch.nonzero(mask, as_tuple=False).t().contiguous()
+        # For L @ x, we need edge (j -> i), so SWAP to get [col, row] = [j, i]
+        edge_index = torch.stack([indices[1], indices[0]], dim=0)
+        # Weight is still A[i,j] = A[indices[0], indices[1]]
+        edge_attr = A[indices[0], indices[1]]
 
-        # Add self-loops
+        # Add self-loops (needed for T_0 identity operation)
         self_loops = torch.arange(self.num_electrodes, device=A.device)
         self_loop_index = torch.stack([self_loops, self_loops])
+        # Self-loop weights set to 1 (identity for T_0)
         self_loop_attr = torch.ones(self.num_electrodes, device=A.device)
 
         # Concatenate: regular edges + self-loops
@@ -1040,8 +1059,8 @@ def visualize_node_importance_subplots(
 if __name__ == "__main__":
 
     # Configuration
-    THRESHOLD = 0
-    N_SAMPLES_PER_CLASS = 50
+    THRESHOLD = 0.0
+    N_SAMPLES_PER_CLASS = 5000
     N_LINES = 10
     BATCH_SIZE = 256
     DEVICE = torch.device(
@@ -1102,7 +1121,7 @@ if __name__ == "__main__":
 
     # Visualize learned adjacency
     print("\nVisualizing learned adjacency matrix...")
-    visualize_learned_adjacency(model, threshold=THRESHOLD, save_path="learned_adjacency.png")
+    visualize_learned_adjacency(model, threshold=THRESHOLD, save_path="plots/learned_adjacency.png")
 
     # Prepare PyG-compatible model
     print("\nPreparing PyG-compatible model for GNNExplainer...")
