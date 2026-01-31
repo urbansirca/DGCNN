@@ -30,98 +30,75 @@ Preprocessed_EEG/
 
 ## Usage
 
-### Train DGCNN
+This project has **two main entry points**:
 
-**Quick test (one fold, 5 epochs):**
-```bash
-python train_dgcnn_seed.py --quick
-```
+### 1. Main Pipeline (EEG + Contrastive Extensions)
 
-**Full leave-one-subject-out cross-validation:**
+This is the primary workflow for training DGCNN on EEG data and generating contrastive explanations.
+
+#### Step 1: Train DGCNN Model
 ```bash
-python train_dgcnn_seed.py --epochs 50
+python train_dgcnn.py
 ```
 
 This will:
-- Train 15 models (one per fold)
-- Save best model for each subject in `./checkpoints/`
-- Report mean accuracy across subjects
+- Train DGCNN on the SEED EEG dataset
+- Save the best model to `ckpts/dgcnn_seed_model.pth`
+- Expected accuracy: ~90% on test set
 
-Expected results: ~75-80% accuracy (subject-independent)
-
-### Generate Explanations
-
-**Standard GNNExplainer:**
+#### Step 2: Generate Explanations
 ```bash
-python gnnexplainer_dgcnn.py \
-    --checkpoint checkpoints/dgcnn_subject_1_best.pt \
-    --num_samples 50 \
-    --output_dir explanations/standard
+python main.py
 ```
 
-**Contrastive explanations:**
+This will:
+- Load the trained DGCNN model from `ckpts/dgcnn_seed_model.pth`
+- Convert the model to PyG-compatible format
+- Generate **standard GNNExplainer** explanations (per-class prototypes)
+- Generate **contrastive GNNExplainer** explanations (pairwise class comparisons)
+- Compute validation metrics (fidelity, sparsity, stability)
+- Save visualizations to `plots/` directory
+
+**Output files in `plots/`:**
+- `learned_adjacency.png`: Learned adjacency matrix from DGCNN
+- `standard_node_all_agg.png`: Standard node importance (aggregated features)
+- `standard_prototype_topomap_node_agg.png`: Topographic maps of node importance
+- `standard_prototype_edge.png`: Standard edge importance visualizations
+- `contrastive_edge_all.png`: Contrastive edge importance (6 pairwise comparisons)
+- `contrastive_node_all.png`: Contrastive node importance
+- `contrastive_topomap_node_all_agg.png`: Topographic maps for contrastive explanations
+- `sparsity_curve_standard.png`: Sparsity vs. fidelity curves for standard GNNExplainer
+- `sparsity_curve_contrastive.png`: Sparsity vs. fidelity curves for contrastive GNNExplainer
+- `validation_summary_comparison.png`: Comparison of standard vs. contrastive metrics
+
+### 2. GNNExplainer Reproduction (Synthetic Datasets)
+
+For reproducing the original GNNExplainer paper results on synthetic datasets, see the `reproduction/` folder. This contains a minimal implementation on synthetic graph datasets (syn1, syn3).
+
 ```bash
-python gnnexplainer_dgcnn.py \
-    --checkpoint checkpoints/dgcnn_subject_1_best.pt \
-    --num_samples 50 \
-    --contrastive \
-    --output_dir explanations/contrastive
+cd reproduction
+python run_gnn_explainer.py --dataset syn1 --node-idx 300
 ```
 
-### Output Files
-
-After running the explainer:
-- `edge_masks.npy`: Edge importance for each sample [N, 62, 62]
-- `node_masks.npy`: Node feature importance for each sample [N, 62, 5]
-- `mean_edge_mask.npy`: Aggregated edge importance [62, 62]
-- `mean_node_mask.npy`: Aggregated node importance [62, 5]
-- `edge_importance.png`: Visualisation of edge importance
-- `node_importance.png`: Visualisation per electrode and frequency band
+See [reproduction/README.md](reproduction/README.md) for more details.
 
 ## Project Structure
 
 ```
 .
-├── train_dgcnn_seed.py      # Training script
-├── gnnexplainer_dgcnn.py    # Custom GNNExplainer implementation
+├── train_dgcnn.py           # [Step 1] Train DGCNN on SEED dataset
+├── main.py                  # [Step 2] Generate explanations with contrastive loss
+├── convertDGCNN.py          # Convert DGCNN to PyG-compatible format
+├── contrastive_explainer.py # Contrastive GNNExplainer implementation
+├── plotting.py              # Visualization utilities
 ├── requirements.txt
 ├── README.md
 ├── Preprocessed_EEG/        # SEED dataset (download separately)
-├── seed_de_cache/           # Cached preprocessed data (auto-generated)
-├── checkpoints/             # Saved models
-└── explanations/            # Generated explanations
+├── ckpts/                   # Saved models
+├── plots/                   # Generated visualizations
+└── reproduction/            # GNNExplainer reproduction on synthetic datasets
+    ├── run_gnn_explainer.py
+    ├── gnnexplainer.py
+    └── models.py
 ```
 
-## Key Implementation Details
-
-### Why custom GNNExplainer?
-
-PyTorch Geometric's GNNExplainer expects:
-- Sparse `edge_index` format: `[2, num_edges]`
-- Message-passing layers (GCNConv, GATConv, etc.)
-
-DGCNN uses:
-- Dense adjacency matrix: `[62, 62]`
-- Chebyshev spectral convolution
-
-Our implementation directly masks the dense adjacency matrix during forward passes.
-
-### Contrastive Objective
-
-Standard: "Why class X?"
-```
-L = -log P(Y=x | masked_graph) + sparsity + entropy
-```
-
-Contrastive: "Why class X instead of Y?"
-```
-L = -log P(Y=x | masked_graph) + log P(Y=y | masked_graph) + sparsity + entropy
-```
-
-This finds edges that discriminate between emotions, not just predict one.
-
-## References
-
-- Song et al. (2020). "EEG Emotion Recognition Using Dynamical Graph Convolutional Neural Networks." IEEE TAFFC.
-- Ying et al. (2019). "GNNExplainer: Generating Explanations for Graph Neural Networks." NeurIPS.
-- Zhdanov et al. (2022). "Investigating Brain Connectivity with Graph Neural Networks and GNNExplainer." ICPR.

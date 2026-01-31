@@ -7,15 +7,21 @@ import torch.nn.functional as F
 class ContrastiveGNNExplainer(GNNExplainer):
     """
     GNNExplainer with contrastive loss to find features that distinguish
-    one class from another.
+    one class from another class or all other classes.
 
-    Loss: -log P(Y=c | G_s) + log P(Y=c' | G_s) + λ1 * ||M_e||_1 + λ2 * H(M_e)
+    Loss (one-vs-one): -log P(Y=c | G_s) + λ_contrast * log P(Y=c' | G_s)
+          + λ1 * ||M_e||_1 + λ2 * H(M_e)
+
+    Loss (one-vs-rest): -log P(Y=c | G_s) + λ_contrast * mean(log P(Y=c' | G_s)) for all c' != c
+          + λ1 * ||M_e||_1 + λ2 * H(M_e)
 
     Args:
         epochs (int): Number of optimization epochs
         lr (float): Learning rate
-        contrast_class (int): The contrasting class c' to push away from
+        num_classes (int): Total number of classes
         contrast_weight (float): Weight for the contrastive term (default: 1.0)
+        contrast_class (int, optional): Specific class to contrast against (one-vs-one).
+                                        If None, contrast against all other classes (one-vs-rest).
         **kwargs: Additional coefficients passed to GNNExplainer
     """
 
@@ -23,23 +29,21 @@ class ContrastiveGNNExplainer(GNNExplainer):
         self,
         epochs: int = 100,
         lr: float = 0.01,
-        contrast_class: int = None,
+        num_classes: int = 3,
         contrast_weight: float = 1.0,
+        contrast_class: int = None,
         **kwargs
     ):
         super().__init__(epochs=epochs, lr=lr, **kwargs)
-        self.contrast_class = contrast_class
+        self.num_classes = num_classes
         self.contrast_weight = contrast_weight
+        self.contrast_class = contrast_class
 
     def _loss(self, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         Contrastive loss that maximizes probability of target class
-        while minimizing probability of contrast class.
+        while minimizing probability of all other classes.
         """
-        if self.contrast_class is None:
-            # Fall back to standard loss if no contrast class specified
-            return super()._loss(y_hat, y)
-
         # Calculate contrastive loss
         loss = self._calculate_contrastive_loss(y_hat, y)
 
@@ -55,45 +59,51 @@ class ContrastiveGNNExplainer(GNNExplainer):
         self, y_hat: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute: -log P(Y=c | G_s) + contrast_weight * log P(Y=c' | G_s)
+        Compute contrastive loss based on mode:
+
+        One-vs-one: -log P(Y=c | G_s) + contrast_weight * log P(Y=c' | G_s)
+        One-vs-rest: -log P(Y=c | G_s) + contrast_weight * mean(log P(Y=c' | G_s)) for all c' != c
 
         This encourages the subgraph to:
         1. Maximize probability of the true class c
-        2. Minimize probability of the contrast class c'
+        2. Minimize probability of contrast class(es) c'
         """
-        # Get log probabilities
-        log_probs = F.log_softmax(y_hat, dim=-1)
-
         # Handle different input shapes
         if y_hat.dim() == 1:
             y_hat = y_hat.unsqueeze(0)
-            log_probs = F.log_softmax(y_hat, dim=-1)
 
         if y.dim() == 0:
             y = y.unsqueeze(0)
 
+        # Get log probabilities
+        log_probs = F.log_softmax(y_hat, dim=-1)
+
         # Term 1: -log P(Y=c | G_s) - maximize true class probability
-        target_class = y[0].item() if y.numel() == 1 else y
+        target_class = y[0].item()
         nll_target = F.nll_loss(log_probs, y)
 
-        # Term 2: +log P(Y=c' | G_s) - minimize contrast class probability
-        contrast_target = torch.tensor(
-            [self.contrast_class], device=y_hat.device, dtype=torch.long
-        )
+        # Term 2: Contrastive term - depends on mode
+        if self.contrast_class is not None:
+            # One-vs-one: contrast against specific class
+            contrast_log_prob = log_probs[:, self.contrast_class]
+            # We want to minimize P(c'), so we subtract the log prob
+            loss = nll_target - self.contrast_weight * contrast_log_prob.mean()
+        else:
+            # One-vs-rest: contrast against all other classes
+            other_classes = [c for c in range(self.num_classes) if c != target_class]
 
-        if log_probs.size(0) > 1:
-            contrast_target = contrast_target.expand(log_probs.size(0))
+            if len(other_classes) > 0:
+                # Get log probabilities for all other classes
+                other_log_probs = log_probs[:, other_classes]  # [batch, num_other_classes]
+                # Average log probability across other classes
+                mean_other_log_prob = other_log_probs.mean()
 
-        # Note: We ADD this term (not subtract) because we want to MAXIMIZE
-        # P(Y=c') in the negative direction, i.e., minimize it
-        log_prob_contrast = F.nll_loss(log_probs, contrast_target)
-
-        # Contrastive loss: -log P(c) + weight * log P(c')
-        # Since nll_loss = -log P, we have:
-        # loss = nll_target - contrast_weight * log_prob_contrast
-        # which equals: -log P(c) - contrast_weight * (-log P(c'))
-        # which equals: -log P(c) + contrast_weight * log P(c')
-        loss = nll_target - self.contrast_weight * log_prob_contrast
+                # Contrastive loss: -log P(c) - contrast_weight * mean(log P(c'))
+                # Since we want to MINIMIZE P(c'), we subtract the log prob (making it positive contribution)
+                # log P is negative, so -log P is positive. We want to maximize -log P(c') = minimize P(c')
+                loss = nll_target - self.contrast_weight * mean_other_log_prob
+            else:
+                loss = nll_target
 
         return loss
 
@@ -104,13 +114,15 @@ def explain_class_contrast(
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     target_class: int,
-    contrast_class: int,
+    contrast_class: int = None,
+    num_classes: int = 3,
     epochs: int = 200,
     contrast_weight: float = 1.0,
     **explainer_kwargs
 ):
     """
-    Convenience function to explain what distinguishes target_class from contrast_class.
+    Convenience function to explain what distinguishes target_class from contrast_class
+    or all other classes.
 
     Args:
         explainer_model: The PyG-compatible model
@@ -118,7 +130,9 @@ def explain_class_contrast(
         edge_index: Edge indices [2, num_edges]
         edge_weight: Edge weights [num_edges]
         target_class: The class we want to explain (c)
-        contrast_class: The class we want to contrast against (c')
+        contrast_class: The specific class to contrast against (c').
+                       If None, contrast against all other classes (one-vs-rest).
+        num_classes: Total number of classes
         epochs: Number of optimization epochs
         contrast_weight: Weight for the contrastive term
         **explainer_kwargs: Additional kwargs for the explainer
@@ -132,8 +146,9 @@ def explain_class_contrast(
         model=explainer_model,
         algorithm=ContrastiveGNNExplainer(
             epochs=epochs,
-            contrast_class=contrast_class,
+            num_classes=num_classes,
             contrast_weight=contrast_weight,
+            contrast_class=contrast_class,
             **explainer_kwargs
         ),
         explanation_type="model",

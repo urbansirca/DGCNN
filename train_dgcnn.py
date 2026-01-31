@@ -4,10 +4,6 @@ from torch.utils.data import DataLoader
 from torcheeg.datasets import SEEDDataset
 from torcheeg import transforms
 from torcheeg.models import DGCNN
-from torcheeg.model_selection import KFoldPerSubject
-
-# import scheduler
-from torch.optim.lr_scheduler import StepLR
 
 # Config
 BATCH_SIZE = 256
@@ -115,6 +111,5 @@ for epoch in range(EPOCHS):
 
 print("Training complete!")
 
-# save model
 torch.save(model.state_dict(), 'ckpts/dgcnn_seed_model.pth')
 print("Model saved!")

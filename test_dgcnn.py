@@ -173,13 +173,6 @@ def main():
     plt.savefig('plots/confusion_matrix.png', dpi=150)
     print("\nConfusion matrix saved to confusion_matrix.png")
 
-    # Check if model is just predicting one class
-    unique_preds = np.unique(test_preds)
-    if len(unique_preds) < 3:
-        print("\n" + "!"*60)
-        print("WARNING: Model is only predicting classes:", unique_preds)
-        print("This suggests the model may be underfitting or collapsed!")
-        print("!"*60)
 
 
 if __name__ == '__main__':
