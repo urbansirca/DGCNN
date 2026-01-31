@@ -84,7 +84,7 @@ for name in electrode_names:
         node_colors.append('crimson')
 
 # Show only the strongest connections (top N)
-n_lines = 30 
+n_lines = 50 
 
 fig, ax = plt.subplots(figsize=(10, 10), facecolor='black', subplot_kw=dict(polar=True))
 plot_connectivity_circle(
