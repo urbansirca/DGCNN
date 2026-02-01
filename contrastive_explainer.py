@@ -151,7 +151,7 @@ def explain_class_contrast(
             contrast_class=contrast_class,
             **explainer_kwargs
         ),
-        explanation_type="model",
+        explanation_type="phenomenon",
         node_mask_type="attributes",
         edge_mask_type="object",
         model_config=dict(

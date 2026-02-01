@@ -1,15 +1,15 @@
 # GNNExplainer Reproduction on Synthetic Datasets
 
-This folder contains a minimal reproduction of the original GNNExplainer paper ([Ying et al., NeurIPS 2019](https://arxiv.org/abs/1903.03894)) on synthetic graph datasets.
+This folder contains a partial reproduction of the original GNNExplainer paper ([Ying et al., NeurIPS 2019](https://arxiv.org/abs/1903.03894)) on synthetic graph datasets.
 
 ## Overview
 
-This implementation demonstrates GNNExplainer on simple synthetic datasets where ground-truth explanations are known, making it easy to validate that the explainer is working correctly.
+This implementation shows GNNExplainer on simple synthetic datasets where ground-truth explanations are known, making it easy to validate that the explainer is working correctly.
 
 ## Files
 
 - **run_gnn_explainer.py**: Main script to run GNNExplainer on synthetic datasets
-- **gnnexplainer.py**: Core GNNExplainer implementation
+- **gnnexplainer.py**: GNNExplainer implementation
 - **models.py**: GNN model architectures (GCN encoder for node/graph classification)
 
 ## Prerequisites
@@ -19,20 +19,17 @@ You'll need pre-trained model checkpoints for the synthetic datasets. These shou
 Expected checkpoint structure:
 ```
 ../ckpts/
-├── syn1_base_h20_o20/
-│   └── best.pth.tar
-└── syn3_base_h20_o20/
-    └── best.pth.tar
+├── syn1_base_h20_o20.pth.tar
+└── syn3_base_h20_o20.pth.tar
 ```
 you will need to train models first (training script not included in this reproduction).
 
 ## Usage
 
-
 Explain a specific node in the graph:
 
 ```bash
-python run_gnn_explainer.py --dataset syn1 --node-idx 300
+python run_gnn_explainer.py --dataset syn1 --node-idx 304
 ```
 
 **Parameters:**
