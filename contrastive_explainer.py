@@ -63,10 +63,6 @@ class ContrastiveGNNExplainer(GNNExplainer):
 
         One-vs-one: -log P(Y=c | G_s) + contrast_weight * log P(Y=c' | G_s)
         One-vs-rest: -log P(Y=c | G_s) + contrast_weight * mean(log P(Y=c' | G_s)) for all c' != c
-
-        This encourages the subgraph to:
-        1. Maximize probability of the true class c
-        2. Minimize probability of contrast class(es) c'
         """
         # Handle different input shapes
         if y_hat.dim() == 1:
@@ -99,8 +95,6 @@ class ContrastiveGNNExplainer(GNNExplainer):
                 mean_other_log_prob = other_log_probs.mean()
 
                 # Contrastive loss: -log P(c) - contrast_weight * mean(log P(c'))
-                # Since we want to MINIMIZE P(c'), we subtract the log prob (making it positive contribution)
-                # log P is negative, so -log P is positive. We want to maximize -log P(c') = minimize P(c')
                 loss = nll_target - self.contrast_weight * mean_other_log_prob
             else:
                 loss = nll_target

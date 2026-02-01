@@ -1,13 +1,3 @@
-"""
-Main script for DGCNN EEG analysis with GNNExplainer.
-
-This script:
-1. Loads the SEED dataset and trained DGCNN model
-2. Converts the model to PyG-compatible format for explainability
-3. Runs standard GNNExplainer and contrastive explanations
-4. Generates visualizations and validation metrics
-"""
-
 import torch
 import numpy as np
 import json
@@ -148,7 +138,6 @@ def main():
             # aggregate feature/channel importance into one scalar per node
             m = m.abs().mean(dim=-1)
         elif m.dim() != 1:
-            # last-resort: flatten then take mean per node if possible isn't safe; fail loudly
             raise ValueError(
                 f"Unexpected node_mask shape for topomap: {tuple(m.shape)}"
             )

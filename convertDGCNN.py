@@ -5,12 +5,6 @@ import numpy as np
 
 from torch_geometric.nn import MessagePassing
 
-
-# ============================================================================
-# MODEL DEFINITIONS
-# ============================================================================
-
-
 class PyGGraphConvolution(MessagePassing):
     """
     Graph convolution using PyG's message passing for GNNExplainer compatibility.
@@ -335,12 +329,6 @@ def get_class_prototype_explanation(
 ):
     """
     Generate class-level prototype explanation following the GNNExplainer paper.
-
-    This implements the 4-step process described in the original paper:
-    1. Find reference instance (embedding closest to class mean)
-    2. Compute explanations for many instances in the class
-    3. Align explanation graphs to reference
-    4. Aggregate with median for robustness to outliers
     """
     from contrastive_explainer import explain_class_contrast
 
@@ -509,11 +497,6 @@ def get_all_class_prototypes(
 
     return prototypes
 
-
-# ============================================================================
-# VALIDATION METRICS
-# ============================================================================
-
 def compute_fidelity_plus(
     model,
     samples: list,
@@ -524,9 +507,6 @@ def compute_fidelity_plus(
 ):
     """
     Fidelity+ (Sufficiency): Remove top-k% important edges and measure accuracy DROP.
-
-    High Fidelity+ means: removing important edges significantly hurts accuracy.
-    This validates that the explanation identifies truly important edges.
     """
     model.eval()
 
@@ -534,7 +514,6 @@ def compute_fidelity_plus(
     masked_correct = 0
     total = len(samples)
 
-    # DEBUG: Track prediction changes
     prediction_changes = 0
     correct_to_incorrect = 0
 
@@ -600,9 +579,6 @@ def compute_fidelity_minus(
 ):
     """
     Fidelity- (Comprehensiveness): Keep ONLY top-k% important edges and measure accuracy.
-
-    High Fidelity- means: keeping only important edges maintains accuracy.
-    This validates that the explanation captures sufficient information.
     """
     model.eval()
 
@@ -663,9 +639,6 @@ def compute_sparsity_curve(
 ):
     """
     Compute accuracy vs sparsity curve.
-
-    Shows how accuracy changes as we keep fewer edges (only the most important ones).
-    A good explanation should maintain high accuracy with few edges.
     """
     if percentiles is None:
         percentiles = [5, 10, 20, 30, 50, 70, 100]
@@ -685,7 +658,6 @@ def compute_stability(edge_masks_list: list):
     Compute stability/consistency of explanations across multiple samples.
 
     High stability means the explainer gives consistent results for similar inputs.
-    Uses Intersection over Union (IoU) of top-k edges.
     """
     n_samples = len(edge_masks_list)
     if n_samples < 2:
